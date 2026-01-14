@@ -1,0 +1,7 @@
+# Core dependencies
+# No external dependencies needed - using stdlib only for maximum portability
+# ssl, socket, ctypes are all stdlib
+
+# Development dependencies (optional)
+# pytest>=7.0.0
+# black>=22.0.0

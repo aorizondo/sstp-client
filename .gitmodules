@@ -1,0 +1,3 @@
+[submodule "py-lwip"]
+	path = py-lwip
+	url = https://github.com/vvish/py-lwip.git
