@@ -20,7 +20,14 @@ class ip4_addr_t(ctypes.Structure):
 
 
 class netif(ctypes.Structure):
-    pass  # Forward declaration
+    _fields_ = [
+        ("next", ctypes.c_void_p),
+        ("ip_addr", ip4_addr_t),
+        ("netmask", ip4_addr_t),
+        ("gw", ip4_addr_t),
+        # Add large padding to prevent lwIP from overwriting other memory
+        ("padding", ctypes.c_uint8 * 1024),
+    ]
 
 
 # Callback types
@@ -93,7 +100,7 @@ class LwIPWrapper:
                 ctypes.c_char_p,
                 ctypes.c_char_p
             ]
-            self.lib.ppp_set_auth.restype = ctypes.c_int
+            self.lib.ppp_set_auth.restype = None
             
             # err_t ppp_connect(ppp_pcb *pcb, u16_t holdoff)
             self.lib.ppp_connect.argtypes = [ctypes.c_void_p, ctypes.c_uint16]
@@ -103,6 +110,14 @@ class LwIPWrapper:
             self.lib.ppp_close.argtypes = [ctypes.c_void_p, ctypes.c_uint8]
             self.lib.ppp_close.restype = ctypes.c_int
             
+            # void sys_check_timeouts(void)
+            self.lib.sys_check_timeouts.argtypes = []
+            self.lib.sys_check_timeouts.restype = None
+            
+            # ppp_get_mppe_keys(ppp_pcb *pcb, u8_t *send_key, u8_t *recv_key)
+            self.lib.ppp_get_mppe_keys.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint8)]
+            self.lib.ppp_get_mppe_keys.restype = None
+
             logger.debug("lwIP PPP functions loaded successfully")
         except AttributeError as e:
             logger.warning(f"Some PPP functions not found: {e}")
@@ -171,17 +186,18 @@ class LwIPWrapper:
             logger.info("PPP interface created successfully")
             
             # Set authentication (PPPAUTHTYPE_ANY = 0xff)
-            auth_result = self.lib.ppp_set_auth(
+            # CRITICAL: We must keep references to these bytes because lwIP likely keeps pointers
+            self._u_bytes = username.encode('utf-8')
+            self._p_bytes = password.encode('utf-8')
+            logger.info(f"Setting PPP auth: user='{username}' ({len(self._u_bytes)} bytes), pass_len={len(self._p_bytes)}")
+            
+            self.lib.ppp_set_auth(
                 self.ppp_pcb,
                 0xff,  # PPPAUTHTYPE_ANY
-                username.encode('utf-8'),
-                password.encode('utf-8')
+                self._u_bytes,
+                self._p_bytes
             )
-            
-            if auth_result != 0:
-                logger.warning(f"ppp_set_auth returned {auth_result}")
-            else:
-                logger.info(f"PPP authentication configured for user: {username}")
+            logger.info(f"PPP authentication configured for user: {username}")
             
         except Exception as e:
             logger.error(f"Failed to create PPP interface: {e}")
@@ -198,6 +214,46 @@ class LwIPWrapper:
         else:
             logger.info("PPP connection initiated")
     
+    def get_ip_addresses(self) -> dict:
+        """Get assigned IP addresses from the netif."""
+        if not self.netif_ptr:
+            return {}
+        
+        try:
+            import struct
+            ni = self.netif_ptr.contents
+            # Extract bytes from u32 addr (stored in network order, read as LE on x86)
+            ip_bytes = struct.pack('<I', ni.ip_addr.addr)
+            mask_bytes = struct.pack('<I', ni.netmask.addr)
+            gw_bytes = struct.pack('<I', ni.gw.addr)
+            
+            return {
+                "ip": ".".join(map(str, ip_bytes)),
+                "netmask": ".".join(map(str, mask_bytes)),
+                "gw": ".".join(map(str, gw_bytes))
+            }
+        except Exception as e:
+            logger.error(f"Error extracting IP addresses: {e}")
+            return {}
+
+    def get_mppe_keys(self) -> tuple:
+        """Get MPPE send and receive keys."""
+        if not self.ppp_pcb:
+            return None, None
+        
+        send_key = (ctypes.c_uint8 * 16)()
+        recv_key = (ctypes.c_uint8 * 16)()
+        
+        self.lib.ppp_get_mppe_keys(self.ppp_pcb, send_key, recv_key)
+        return bytes(send_key), bytes(recv_key)
+
+    def process_timeouts(self):
+        """Process lwIP timers."""
+        try:
+            self.lib.sys_check_timeouts()
+        except Exception as e:
+            logger.error(f"Error processing timeouts: {e}")
+            
     def feed_ppp_frame(self, frame: bytes):
         """Feed PPP frame into lwIP stack.
         

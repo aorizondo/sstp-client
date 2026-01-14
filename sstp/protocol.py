@@ -4,11 +4,12 @@ Based on Microsoft's [MS-SSTP] specification.
 """
 import struct
 from enum import IntEnum
+from typing import Optional
 
 
 class SSTPVersion(IntEnum):
     """SSTP protocol version."""
-    SSTP_VERSION_1 = 0x10
+    SSTP_VERSION_1 = 0x01
 
 
 class SSTPMessageType(IntEnum):
@@ -51,10 +52,12 @@ class SSTPPacket:
     
     def pack(self) -> bytes:
         """Pack SSTP packet to bytes."""
-        # Byte 0: Version (high 4 bits) + Reserved (low 4 bits, set C bit if control)
-        byte0 = (self.version << 4) | (0x01 if self.is_control else 0x00)
-        # Byte 1: Reserved
-        byte1 = 0x00
+        # Many implementations (e.g. sstp-client) use 0x10 for the first byte 
+        # for Version 1, and 0x01 for the second byte if it's a control packet.
+        
+        byte0 = 0x10
+        byte1 = 0x01 if self.is_control else 0x00
+        
         # Bytes 2-3: Length (big endian)
         length = self.HEADER_SIZE + len(self.data)
         
@@ -69,8 +72,9 @@ class SSTPPacket:
         
         byte0, byte1, length = struct.unpack('!BBH', data[:cls.HEADER_SIZE])
         
+        # Version is usually in high nibble of byte0
         version = (byte0 >> 4) & 0x0F
-        is_control = bool(byte0 & 0x01)
+        is_control = bool(byte1 & 0x01)
         packet_data = data[cls.HEADER_SIZE:length]
         
         return cls(version, is_control, length, packet_data)
@@ -91,8 +95,11 @@ class SSTPControlPacket:
         # Pack attributes
         attr_data = b''
         for attr_id, attr_value in self.attributes:
-            attr_len = 4 + len(attr_value)  # ID (1) + Reserved (1) + Length (2) + Value
-            attr_data += struct.pack('!BBH', attr_id, 0x00, attr_len) + attr_value
+            attr_len = 4 + len(attr_value)
+            # Byte 0: Reserved (7 bits) + M (1 bit). M=1 means Mandatory.
+            # Byte 1: Attribute ID (1 byte)
+            # Byte 2-3: Length (2 bytes)
+            attr_data += struct.pack('!BBH', 0x01, attr_id, attr_len) + attr_value
         
         return header + attr_data
     
@@ -110,7 +117,8 @@ class SSTPControlPacket:
         for _ in range(num_attrs):
             if offset + 4 > len(data):
                 break
-            attr_id, _, attr_len = struct.unpack('!BBH', data[offset:offset+4])
+            # Byte 0: Reserved/M, Byte 1: Attr ID, Byte 2-3: Length
+            _, attr_id, attr_len = struct.unpack('!BBH', data[offset:offset+4])
             attr_value = data[offset+4:offset+attr_len]
             attributes.append((attr_id, attr_value))
             offset += attr_len
@@ -132,11 +140,39 @@ def create_call_connect_request() -> bytes:
     return packet.pack()
 
 
-def create_call_connected() -> bytes:
+def create_call_connected(attributes: Optional[list] = None) -> bytes:
     """Create SSTP CALL_CONNECTED packet."""
-    control = SSTPControlPacket(SSTPMessageType.CALL_CONNECTED)
+    control = SSTPControlPacket(
+        SSTPMessageType.CALL_CONNECTED,
+        attributes=attributes or []
+    )
     packet = SSTPPacket(is_control=True, data=control.pack())
     return packet.pack()
+
+
+def create_crypto_binding_attribute(nonce: bytes, cmk: bytes) -> bytes:
+    """Create CRYPTO_BINDING attribute value.
+    
+    Args:
+        nonce: 32-byte nonce from CRYPTO_BINDING_REQ
+        cmk: Computed Compound MAC Key (HMAC-SHA256)
+        
+    Returns:
+        Packed attribute value (excluding attribute header)
+    """
+    # [MS-SSTP] Section 2.2.6
+    # Reserved (3 bytes) + Hash Protocol ID (1 byte) + Nonce (32 bytes) + Cert Hash (32 bytes) + MAC (32 bytes)
+    # Hash Protocol ID: 0x01 = SHA256
+    
+    cert_hash = b'\x00' * 32
+    
+    # Pack Reserved (3) + Hash Protocol ID (1)
+    value = b'\x00\x00\x00\x01'
+    value += nonce
+    value += cert_hash
+    value += cmk
+    
+    return value
 
 
 def create_echo_request() -> bytes:
